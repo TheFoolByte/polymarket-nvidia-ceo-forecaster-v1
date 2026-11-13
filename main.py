@@ -1,24 +1,38 @@
 #!/usr/bin/env python3
-"""Polymarket NVIDIA CEO forecaster v3.
+"""Polymarket NVIDIA CEO forecaster v5 (round-5 pick: candidate B).
 
 Forecasts the Yes price of every trading market of Polymarket's
 "Next CEO of NVIDIA?" event, minute by minute, 4 hours ahead (240 min),
 as five quantiles (0.05, 0.25, 0.5, 0.75, 0.95).
 
-Method (research waves 1-3, all measurements on practice p00-p05):
+Method (research waves 1-4, all measurements on practice p00-p05):
+v3 revised base (GK range vol + OU blend, mixture z, legal CQR pad
+with per-market skip) + wave-4 candidate B:
+- GK window 540 min (hl=60) — the calm-prior window; smoother, best
+  p04+p05.
+- Vol-split tail (wave-4 §1): markets whose blended sigma at h=5 is at
+  or above the cross-market median get outer z x0.80 ([-1.52, -0.55, 0,
+  0.55, 1.52]); the rest keep [-1.90, -0.55, 0, 0.55, 1.90]. A
+  calibration fix (high-vol markets' sigma is already large, so their
+  outer z must be narrower or the interval over-widens).
+- Leader-only reversion (wave-4 §6): the market with the highest
+  checkpoint price drifts toward the field median price by
+  0.05 * (medx - x) * (h/240). A directional bet that the leader keeps
+  falling; the dose-response is smooth and monotonic in p04+p05.
 - Median = checkpoint price (no drift; 1-min return autocorr is ~-0.06,
   trend slopes are negative).
 - Per-market sigma from RECENT vol only, two components blended in
   variance space (0.5/0.5):
   * GK: Garman-Klass range vol from 5-min bars (O/H/L/C from the 1-min
-    closes) over the trailing 360 min, bars recency-weighted with a
+    closes) over the trailing 540 min, bars recency-weighted with a
     60-min half-life; sigma5 = x * sqrt(max(GK, 0)); the horizon shape
     is sigma_GK(h) = sigma5 * (h/5)^0.3.
   * OU: S_inf = std_60(trailing 6h) / sqrt(1-exp(-2*0.015*60));
     sigma_OU(h) = S_inf * sqrt(1-exp(-2*0.015*h)).
   * Blend: sigma(h) = sqrt(0.5*sigma_GK^2 + 0.5*sigma_OU^2).
 - Quantile shape: mixture z = [-1.90, -0.55, 0, +0.55, +1.90] (narrow
-  core, fat tails; the 240-min change distribution has kurtosis 15.5).
+  core, fat tails; the 240-min change distribution has kurtosis 15.5),
+  with the vol-split outer-z scaling above.
 - Rolling CQR pad on the 0.05/0.95 quantiles, computed ONLY from the
   case's own price history (no answers): 12 pseudo-checkpoints every
   60 min over the trailing 12h; conformity score s = max(q05-y, y-q95)
@@ -26,7 +40,9 @@ Method (research waves 1-3, all measurements on practice p00-p05):
   pad[h] = 90th percentile of s pooled over markets and checkpoints,
   smoothed with a 31-min moving average. The pseudo-forecasts use the
   v1 Gaussian forecaster (EWMA+OU), exactly as the measured reference.
-  If no scores exist for a horizon, pad = 0.
+  If no scores exist for a horizon, pad = 0. A pseudo-checkpoint skips
+  only the markets with < 200 prices before it (a single young market
+  must not veto the pad for everyone).
 - Floors: sigma5 >= 0.0003, sigma(h) >= 0.0005.
 - Short-history markets (<120 min of prices): shrink sigma 50% toward
   the cross-market median sigma(h).
@@ -37,12 +53,13 @@ Method (research waves 1-3, all measurements on practice p00-p05):
   dependence, markets in input order, sorted JSON keys).
 
 Practice (6 cases, local pinball scorer reproducing the house baseline
-exactly, 0.363589): pooled 0.289148, p04+p05 0.157176, coverage 0.8427
-(v1: 0.300215 / 0.155441 / 0.8198). Runtime ~0.11-0.21 s/case (cap 8 s).
+exactly, 0.363589): pooled 0.284604, p04+p05 0.148161, coverage 0.8464
+(v3 revised: 0.288058 / 0.151917 / 0.8643; v4: 0.284752 / 0.151968 /
+0.8510; candidate C: 0.284268 / 0.148674 / 0.8436; v4+wave-4 stack:
+0.283000 / 0.149479 / 0.8339). Runtime ~0.35 s/case (cap 8 s).
 
-Tunable via env vars (defaults are v3): MF_GK_WINDOW (360), MF_GK_HL (60).
-The 540-min safer variant (pooled 0.293519, p04+p05 0.155334) is
-MF_GK_WINDOW=540.
+Tunable via env vars (defaults are candidate B): MF_GK_WINDOW (540),
+MF_GK_HL (60), MF_TAIL_HI (0.80), MF_REV_K (0.05).
 """
 import glob
 import json
@@ -53,11 +70,14 @@ Z_MIX = [-1.90, -0.55, 0.0, 0.55, 1.90]
 Z_GAUSS = [-1.644854, -0.674490, 0.0, 0.674490, 1.644854]
 TAUS = [0.05, 0.25, 0.5, 0.75, 0.95]
 
-GK_WINDOW = int(os.environ.get("MF_GK_WINDOW", "360"))
+GK_WINDOW = int(os.environ.get("MF_GK_WINDOW", "540"))
 GK_HL = float(os.environ.get("MF_GK_HL", "60"))
+GK_MED = float(os.environ.get("MF_GK_MED", "0"))  # v4: linear blend of sigma toward cross-market median (0.2)
+ALPHA = float(os.environ.get("MF_ALPHA", "0.3"))  # v4: 0.35
+THETA = float(os.environ.get("MF_THETA", "0.015"))  # v4: 0.02
+TAIL_HI = float(os.environ.get("MF_TAIL_HI", "0.80"))  # wave-4 vol-split tail: high-vol markets get outer z x TAIL_HI; 1.0 = off
+REV_K = float(os.environ.get("MF_REV_K", "0.05"))  # wave-4 leader-only reversion strength; 0 = off
 HL = 60.0
-ALPHA = 0.3
-THETA = 0.015
 BLEND = 0.5
 OPEN_EXCL = 60
 W_EWMA_MIN = 1440   # EWMA window (pseudo-forecaster only)
@@ -173,17 +193,19 @@ def _median_sigma(sig, horizon):
 
 
 def _forecast_rows(markets, sig, med, z, horizon):
+    """z: a single z list, or a dict mid -> z list (wave-4 vol-split tail)."""
     out = {}
     for m in markets:
         p = m["prices"]
         x = p[-1]
         s = sig[m["id"]]
+        zm = z[m["id"]] if isinstance(z, dict) else z
         if len(p) < SHORT_N:
             s = [SHRINK * v + (1.0 - SHRINK) * med[i]
                  for i, v in enumerate(s)]
         rows = []
         for i in range(horizon):
-            row = [clamp6(x + zz * s[i]) for zz in z]
+            row = [clamp6(x + zz * s[i]) for zz in zm]
             for j in range(1, 5):
                 if row[j] < row[j - 1]:
                     row[j] = row[j - 1]
@@ -192,8 +214,27 @@ def _forecast_rows(markets, sig, med, z, horizon):
     return out
 
 
+def _z_by_vol(sig, horizon):
+    """Wave-4 vol-split tail: markets whose blended sigma at h=5 is at or
+    above the cross-market median get outer z x TAIL_HI (narrower tails
+    where sigma is already large); the rest keep the full mixture z.
+    TAIL_HI = 1.0 disables it (all markets keep Z_MIX)."""
+    if TAIL_HI >= 1.0:
+        return Z_MIX
+    gk5 = {mid: sig[mid][4] for mid in sig}
+    vals = sorted(gk5.values())
+    k = len(vals)
+    med5 = vals[k // 2] if k % 2 == 1 else 0.5 * (vals[k // 2 - 1] + vals[k // 2])
+    zm = {}
+    for mid in gk5:
+        t = TAIL_HI if gk5[mid] >= med5 else 1.0
+        zm[mid] = [-1.90 * t, -0.55, 0.0, 0.55, 1.90 * t]
+    return zm
+
+
 def forecast_case(case, window_min=GK_WINDOW, hl=GK_HL, z=Z_MIX):
-    """The v3 forecast: GK vol + OU blend, mixture z."""
+    """The v3 forecast: GK vol + OU blend, mixture z (+ wave-4 vol-split
+    tail and v4 median blend when their knobs are set)."""
     markets = case["markets"]
     horizon = int(case.get("horizon_minutes", 240))
     h_list = list(range(1, horizon + 1))
@@ -209,7 +250,12 @@ def forecast_case(case, window_min=GK_WINDOW, hl=GK_HL, z=Z_MIX):
     for mid in sig:
         sig[mid] = [max(v, SIGMA_FLOOR) for v in sig[mid]]
     med = _median_sigma(sig, horizon)
-    return _forecast_rows(markets, sig, med, z, horizon)
+    if GK_MED > 0:
+        for mid in sig:
+            sig[mid] = [(1.0 - GK_MED) * v + GK_MED * med[i]
+                        for i, v in enumerate(sig[mid])]
+    zmap = _z_by_vol(sig, horizon) if TAIL_HI < 1.0 else z
+    return _forecast_rows(markets, sig, med, zmap, horizon)
 
 
 def forecast_case_gauss(case):
@@ -305,9 +351,44 @@ def apply_pad(rows_by_id, pad):
     return out
 
 
+def apply_reversion(rows_by_id, case):
+    """Wave-4 leader-only reversion: the market with the highest
+    checkpoint price drifts toward the field median price by
+    REV_K * (medx - x) * (h/240). REV_K = 0 disables it. Applied to the
+    rows before the CQR pad; re-clamps and re-enforces monotonicity."""
+    if REV_K == 0:
+        return rows_by_id
+    markets = case["markets"]
+    horizon = int(case.get("horizon_minutes", 240))
+    xs = sorted(m["prices"][-1] for m in markets)
+    n = len(xs)
+    medx = xs[n // 2] if n % 2 == 1 else 0.5 * (xs[n // 2 - 1] + xs[n // 2])
+    top = xs[-1]
+    out = {}
+    for m in markets:
+        x = m["prices"][-1]
+        rows = rows_by_id[m["id"]]
+        if x < top - 1e-9:
+            out[m["id"]] = rows
+            continue
+        drift = [REV_K * (medx - x) * ((i + 1) / 240.0)
+                 for i in range(horizon)]
+        nr = []
+        for i, row in enumerate(rows):
+            r = [clamp6(v + drift[i]) for v in row]
+            for j in range(1, 5):
+                if r[j] < r[j - 1]:
+                    r[j] = r[j - 1]
+            nr.append(r)
+        out[m["id"]] = nr
+    return out
+
+
 def forecast_full(case):
-    """v3: GK + mixture z, then the legal CQR pad on the outer quantiles."""
+    """v3 + wave-4: GK + mixture z (vol-split tail), leader-only
+    reversion, then the legal CQR pad on the outer quantiles."""
     fc = forecast_case(case)
+    fc = apply_reversion(fc, case)
     pad = cqr_pad_legal(case)
     fc = apply_pad(fc, pad)
     markets = case["markets"]

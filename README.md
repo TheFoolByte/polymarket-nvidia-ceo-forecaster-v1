@@ -15,7 +15,7 @@ Closed-form, deterministic, stdlib only. No Monte Carlo, no network.
   24h/72h window is stale. Two components, blended 50/50 in variance
   space:
   - **Garman–Klass range vol** — 5-min bars (O/H/L/C built from the
-    1-min closes) over the trailing 360 min, recency-weighted
+    1-min closes) over the trailing 540 min, recency-weighted
     (half-life 60 min). The high–low range carries far more information
     about volatility than close-to-close changes alone. Horizon shape
     σ(h) = σ₅·(h/5)^0.3.
@@ -30,9 +30,16 @@ Closed-form, deterministic, stdlib only. No Monte Carlo, no network.
   percentile of the conformity score, 31-min smoothing). Jump insurance:
   it raises 90% coverage without costing pinball loss. A
   pseudo-checkpoint skips only the markets with < 200 prices before it
-  (a single young market must not veto the pad for everyone — the old
-  all-or-nothing rule silently disabled the pad for 2 of 6 practice
-  cases); if no market qualifies, the checkpoint is skipped.
+  (a single young market must not veto the pad for everyone).
+- **Vol-split tail** — high-vol markets (GK σ₅ at or above the
+  cross-market median) get their outer quantiles narrowed (z ×0.80);
+  low-vol markets keep ×1.0. High-vol sigmas are already wide, so
+  narrowing their z avoids over-widening — a calibration fix.
+- **Leader-only reversion** — the market with the highest checkpoint
+  price drifts toward the field median by 0.05·(median − x)·(h/240).
+  A directional bet that the leader keeps falling; it costs on cases
+  where the leader does not fall (p02), but the dose-response is smooth
+  and the gain survives leave-one-case-out.
 - **Floors and guards:** σ₅ ≥ 0.0003, σ(h) ≥ 0.0005; markets with
   < 120 min history are shrunk 50% toward the cross-market median σ;
   the opening regime (first 60 min after a market's start) is excluded
@@ -49,7 +56,7 @@ lead-lag, MAD vol, tail ramp.
 |---|---|---|
 | house baseline | 0.363589 | 0.9496 |
 | v1 (EWMA + OU, Gaussian) | 0.300215 | 0.8198 |
-| **v3 (this entry)** | **0.288058** | **0.8643** |
+| **v5 (this entry)** | **0.284604** | **0.8464** |
 
 Lower pinball loss is better. Runtime ~0.18 s/case (limit 8 s).
 
