@@ -28,7 +28,11 @@ Closed-form, deterministic, stdlib only. No Monte Carlo, no network.
 - **Legal rolling CQR pad** on the 0.05/0.95 quantiles — computed only
   from the case's own price history (12 pseudo-checkpoints, 90th
   percentile of the conformity score, 31-min smoothing). Jump insurance:
-  it raises 90% coverage without costing pinball loss.
+  it raises 90% coverage without costing pinball loss. A
+  pseudo-checkpoint skips only the markets with < 200 prices before it
+  (a single young market must not veto the pad for everyone — the old
+  all-or-nothing rule silently disabled the pad for 2 of 6 practice
+  cases); if no market qualifies, the checkpoint is skipped.
 - **Floors and guards:** σ₅ ≥ 0.0003, σ(h) ≥ 0.0005; markets with
   < 120 min history are shrunk 50% toward the cross-market median σ;
   the opening regime (first 60 min after a market's start) is excluded
@@ -45,7 +49,7 @@ lead-lag, MAD vol, tail ramp.
 |---|---|---|
 | house baseline | 0.363589 | 0.9496 |
 | v1 (EWMA + OU, Gaussian) | 0.300215 | 0.8198 |
-| **v3 (this entry)** | **0.289148** | **0.8427** |
+| **v3 (this entry)** | **0.288058** | **0.8643** |
 
 Lower pinball loss is better. Runtime ~0.18 s/case (limit 8 s).
 

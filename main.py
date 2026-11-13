@@ -235,13 +235,17 @@ def forecast_case_gauss(case):
 
 def cqr_pad_legal(case):
     """Rolling conformal pad, computed ONLY from the case's own prices.
-    12 pseudo-checkpoints every 60 min over the trailing 12h. A
-    pseudo-checkpoint is skipped entirely if any market has fewer than
-    200 prices before it. For horizon h only pseudo-checkpoints with
-    offset >= h contribute (their realisation lies inside the case's
-    prices). pad[h] = 90th percentile of the conformity scores
-    s = max(q05 - y, y - q95), smoothed with a 31-min moving average.
-    No cap (matches the measured reference)."""
+    12 pseudo-checkpoints every 60 min over the trailing 12h. A market
+    is skipped from a pseudo-checkpoint (only that market, not the whole
+    checkpoint) if it has fewer than 200 prices before it -- a single
+    young market must not disable the pad for the whole case (the old
+    whole-checkpoint rule left the pad at exactly 0 for p03 and p04,
+    the two cases with a market under 200 prices at the first offset).
+    For horizon h only pseudo-checkpoints with offset >= h contribute
+    (their realisation lies inside the case's prices). pad[h] = 90th
+    percentile of the conformity scores s = max(q05 - y, y - q95),
+    smoothed with a 31-min moving average. No cap (matches the measured
+    reference)."""
     markets = case["markets"]
     horizon = int(case.get("horizon_minutes", 240))
     prices_by_id = {m["id"]: m["prices"] for m in markets}
@@ -249,13 +253,11 @@ def cqr_pad_legal(case):
     for k in range(1, N_PSEUDO + 1):
         off = k * PSEUDO_STEP
         pseudo_markets = []
-        ok = True
         for mid, p in prices_by_id.items():
             if len(p) - 1 - off < 200:
-                ok = False
-                break
+                continue
             pseudo_markets.append({"id": mid, "prices": p[:len(p) - off]})
-        if not ok:
+        if not pseudo_markets:
             continue
         pseudo = {"markets": pseudo_markets,
                   "horizon_minutes": horizon}
@@ -263,11 +265,12 @@ def cqr_pad_legal(case):
             fc = forecast_case_gauss(pseudo)
         except Exception:
             continue
-        for mid, p in prices_by_id.items():
+        for mid, rows in fc.items():
+            p = prices_by_id[mid]
             n_m = len(p)
             for h in range(1, min(off, horizon) + 1):
                 y = p[n_m - 1 - off + h]
-                row = fc[mid][h - 1]
+                row = rows[h - 1]
                 scores[h].append(max(row[0] - y, y - row[4]))
     pad = []
     for h in range(1, horizon + 1):
